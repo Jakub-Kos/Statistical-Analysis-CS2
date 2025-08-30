@@ -32,6 +32,7 @@ def to_pandas(obj) -> pd.DataFrame:
 
 def add_common(df: pd.DataFrame, map_name: str, demo_file: str):
     if df.empty: return df
+    df = df.copy()
     if "map_name" not in df.columns: df.insert(0, "map_name", map_name)
     if "demo_file" not in df.columns: df.insert(1, "demo_file", demo_file)
     return df
@@ -212,6 +213,14 @@ def add_indexes(conn):
         cur.execute('CREATE INDEX IF NOT EXISTS idx_events_shots_eid ON events_shots(event_id);')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_events_grenades_eid ON events_grenades(event_id);')
     except Exception: pass
+
+    try:
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_round_loadouts_mk ON round_loadouts(map_name, demo_file);')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_round_loadouts_round ON round_loadouts(map_name, demo_file, round);')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_round_loadouts_sid ON round_loadouts(map_name, demo_file, steamid);')
+    except Exception:
+        pass
+
     conn.commit()
 
 def write_manifest(conn):
@@ -244,7 +253,13 @@ def main():
     for dem_path in args.demos:
         dem_path = Path(dem_path)
         d = Demo(str(dem_path), verbose=False)
-        d.parse()
+        d.parse(
+            player_props=[
+                "name", "steamid", "team_num",
+                "health", "armor", "has_helmet",
+                "inventory",  # list[str] of weapons/utility
+            ]
+        )
 
         header = getattr(d, "header", {}) or {}
         map_name = header.get("map_name") or header.get("mapName") if isinstance(header, dict) else "unknown"
@@ -260,7 +275,10 @@ def main():
         if not rounds.empty:
             if "round_num" in rounds.columns and "round" not in rounds.columns:
                 rounds = rounds.rename(columns={"round_num":"round"})
-            keep_cols = [c for c in ("round","winner","start","end","bomb_planted","score_ct","score_t") if c in rounds.columns]
+            keep_cols = [c for c in
+                         ("round", "winner", "start", "end", "freeze_end", "bomb_planted", "score_ct", "score_t") if
+                         c in rounds.columns]
+
             if not keep_cols: keep_cols = [c for c in ("round","winner") if c in rounds.columns]
             rounds = rounds[keep_cols]
             rounds = add_common(rounds, map_name, demo_file)
@@ -268,11 +286,136 @@ def main():
         else:
             rounds = pd.DataFrame(columns=["round","winner","start","end"])
 
-        # rmap for this demo
+        # rmap for this demo (we also want freeze_end if present)
         rmap = pd.read_sql(
-            "SELECT round, start, end FROM rounds WHERE demo_file = ? AND map_name = ?",
+            "SELECT round, start, end, freeze_end FROM rounds WHERE demo_file = ? AND map_name = ?",
             conn, params=(demo_file, map_name)
         )
+
+        # === ROUND LOADOUTS ===
+        # Vytvoří per-kolo snapshot výzbroje hráčů (inventář, HP/Kevlar/Helma) v ticku >= freeze_end.
+        ticks = to_pandas(getattr(d, "ticks", None))
+        if not ticks.empty and not rmap.empty:
+            T = ticks.copy()
+
+            # --- Normalize/rename columns across AWPy variants ---
+            ren = {}
+            if "round_num" in T.columns and "round" not in T.columns: ren["round_num"] = "round"
+            if "steamID" in T.columns and "steamid" not in T.columns: ren["steamID"] = "steamid"
+            T = T.rename(columns=ren)
+
+            # Build/derive team_num if missing (fallbacks from side/team text)
+            if "team_num" not in T.columns:
+                if "side" in T.columns:
+                    side = T["side"].astype(str).str.upper()
+                    T["team_num"] = np.where(side.eq("CT"), 3, np.where(side.eq("T"), 2, np.nan))
+                elif "team" in T.columns:
+                    tm = T["team"].astype(str).str.upper()
+                    T["team_num"] = np.where(tm.eq("CT"), 3, np.where(tm.eq("T"), 2, np.nan))
+
+            # We need at minimum: round, tick, steamid, inventory + a few props
+            needed = {"round", "tick", "steamid", "team_num", "name", "inventory"}
+            if not needed.issubset(T.columns):
+                # Try to be graceful: if inventory isn’t there, skip silently for this demo
+                pass
+            else:
+                # Attach freeze_end for each round; fallback to round start if freeze_end is missing
+                rm = rmap.copy()
+                if "freeze_end" not in rm.columns:
+                    rm["freeze_end"] = rm.get("start")  # fallback
+
+                # Ensure numeric for comparisons
+                T["tick"] = pd.to_numeric(T["tick"], errors="coerce")
+                rm["freeze_end"] = pd.to_numeric(rm["freeze_end"], errors="coerce")
+
+                # Merge freeze_end to each player tick row via round
+                T = T.merge(rm[["round", "freeze_end"]], on="round", how="left")
+
+                # Keep only first row per (round, player) with tick >= freeze_end
+                # (if freeze_end NaN, we keep the first available tick for that round)
+                sel = (
+                        (T["freeze_end"].isna()) |
+                        (T["tick"] >= T["freeze_end"])
+                )
+                S = (
+                    T[sel]
+                    .sort_values(["round", "steamid", "tick"])
+                    .groupby(["round", "steamid"], as_index=False)
+                    .first()
+                    .copy()
+                )
+
+                # Keep only live teams (2=T, 3=CT)
+                S = S[S["team_num"].isin([2, 3])].copy()
+
+                # Pretty team label & robust inventory JSON
+                TEAM_MAP = {2: "T", 3: "CT"}
+                S["team"] = S["team_num"].map(TEAM_MAP)
+
+                def inv_to_json(val):
+                    if isinstance(val, (list, tuple, np.ndarray)):
+                        try:
+                            return json.dumps(list(val))
+                        except Exception:
+                            return json.dumps([])
+                    if isinstance(val, str):
+                        # sometimes already JSON, sometimes a single item
+                        v = val.strip()
+                        if v.startswith("[") and v.endswith("]"):
+                            try:
+                                return json.dumps(json.loads(v))
+                            except Exception:
+                                return json.dumps([])
+                        return json.dumps([val])
+                    return json.dumps([])
+
+                S["inventory_json"] = S["inventory"].apply(inv_to_json)
+
+                # Boolean helmet → int (sqlite friendly)
+                if "has_helmet" in S.columns:
+                    S["has_helmet"] = S["has_helmet"].astype("Int64")
+
+                # Column selection (name them explicitly to be stable)
+                keep_cols = ["round", "steamid", "name", "team_num", "team", "health", "armor"]
+                if "has_helmet" in S.columns: keep_cols.append("has_helmet")
+                keep_cols.append("inventory_json")
+
+                loadouts = add_common(S.loc[:, keep_cols].copy(), map_name, demo_file)
+
+                # Stable synthetic id (demo_file|round|steamid) if you want it (handy for joins)
+                loadouts = loadouts.assign(
+                    row_id=loadouts.apply(
+                        lambda r: hsh([r.get("demo_file"), r.get("round"), r.get("steamid")]),
+                        axis=1
+                    )
+                )
+
+                write_df_sqlite(conn, loadouts, "round_loadouts")
+
+                # (Optional) Fully normalized items table: one row per item
+                # Uncomment this block if you want easy SQL counts per weapon.
+                """
+                rows = []
+                for _, r in loadouts.iterrows():
+                    inv = []
+                    try:
+                        inv = json.loads(r["inventory_json"]) or []
+                    except Exception:
+                        inv = []
+                    for item in inv:
+                        rows.append({
+                            "map_name": r["map_name"],
+                            "demo_file": r["demo_file"],
+                            "round": int(r["round"]) if pd.notna(r["round"]) else None,
+                            "steamid": r["steamid"],
+                            "team": r["team"],
+                            "item": str(item),
+                            "row_id": r["row_id"],
+                        })
+                if rows:
+                    items_df = pd.DataFrame(rows)
+                    write_df_sqlite(conn, items_df, "round_loadout_items")
+                """
 
         # KILLS (slim pass-through, with round mapping if needed)
         kills = to_pandas(getattr(d, "kills", None))
