@@ -376,10 +376,38 @@ def main():
                     S["has_helmet"] = S["has_helmet"].astype("Int64")
 
                 # Column selection (name them explicitly to be stable)
-                keep_cols = ["round", "steamid", "name", "team_num", "team", "health", "armor"]
-                if "has_helmet" in S.columns: keep_cols.append("has_helmet")
-                keep_cols.append("inventory_json")
+                # --- Canonicalize optional columns on S ---
+                rename_opt = {}
 
+                # armor can be called kevlar / armorValue / armor_value
+                armor_cand = next((c for c in ["armor", "kevlar", "armorValue", "armor_value"] if c in S.columns), None)
+                if armor_cand and armor_cand != "armor":
+                    rename_opt[armor_cand] = "armor"
+
+                # helmet can be hasHelmet / helmet
+                helmet_cand = next((c for c in ["has_helmet", "hasHelmet", "helmet"] if c in S.columns), None)
+                if helmet_cand and helmet_cand != "has_helmet":
+                    rename_opt[helmet_cand] = "has_helmet"
+
+                # health can be hp / healthValue
+                health_cand = next((c for c in ["health", "hp", "healthValue"] if c in S.columns), None)
+                if health_cand and health_cand != "health":
+                    rename_opt[health_cand] = "health"
+
+                if rename_opt:
+                    S = S.rename(columns=rename_opt)
+
+                # Ensure columns exist even if missing in this demo
+                for col, default in [("health", pd.NA), ("armor", pd.NA), ("has_helmet", pd.NA)]:
+                    if col not in S.columns:
+                        S[col] = default
+
+                # sqlite-friendly ints where present
+                if "has_helmet" in S.columns:
+                    S["has_helmet"] = S["has_helmet"].astype("Int64")
+
+                keep_cols = ["round", "steamid", "name", "team_num", "team", "health", "armor", "has_helmet",
+                             "inventory_json"]
                 loadouts = add_common(S.loc[:, keep_cols].copy(), map_name, demo_file)
 
                 # Stable synthetic id (demo_file|round|steamid) if you want it (handy for joins)
@@ -420,15 +448,61 @@ def main():
         # KILLS (slim pass-through, with round mapping if needed)
         kills = to_pandas(getattr(d, "kills", None))
         if not kills.empty:
+            k = kills.copy()
+
+            # --- normalize column names across AWPy variants ---
             ren = {}
-            if "round_num" in kills.columns and "round" not in kills.columns: ren["round_num"]="round"
-            if "killerSide" not in kills.columns and "attacker_side" in kills.columns: ren["attacker_side"]="killerSide"
-            if ren: kills = kills.rename(columns=ren)
-            if not kills.empty and not rmap.empty:
-                kills = attach_round_by_tick(kills, rmap, tick_col="tick")
-            keep = [c for c in ["round","tick","killerSteamID","victimSteamID","killerSide","weapon","headshot","x","y","z"] if c in kills.columns]
+            # round
+            if "round_num" in k.columns and "round" not in k.columns: ren["round_num"] = "round"
+            # sides
+            if "attacker_side" in k.columns and "killerSide" not in k.columns: ren["attacker_side"] = "killerSide"
+            # ids (prefer killerSteamID/victimSteamID)
+            if "killer_steamid" in k.columns and "killerSteamID" not in k.columns: ren[
+                "killer_steamid"] = "killerSteamID"
+            if "attacker_steamid" in k.columns and "killerSteamID" not in k.columns: ren[
+                "attacker_steamid"] = "killerSteamID"
+            if "victim_steamid" in k.columns and "victimSteamID" not in k.columns: ren[
+                "victim_steamid"] = "victimSteamID"
+            # headshot
+            if "is_headshot" in k.columns and "headshot" not in k.columns: ren["is_headshot"] = "headshot"
+            # weapon name fallback
+            if "weapon_name" in k.columns and "weapon" not in k.columns: ren["weapon_name"] = "weapon"
+
+            if ren: k = k.rename(columns=ren)
+
+            # Map to rounds via tick if available
+            if not k.empty and not rmap.empty and "tick" in k.columns:
+                k = attach_round_by_tick(k, rmap, tick_col="tick")
+
+            # --- coordinates → normalized x,y,z (prefer victim, then attacker/killer, then generic) ---
+            if not all(c in k.columns for c in ("x", "y", "z")):
+                coord_candidates = [
+                    ("victim_X", "victim_Y", "victim_Z"),
+                    ("attacker_X", "attacker_Y", "attacker_Z"),
+                    ("killer_X", "killer_Y", "killer_Z"),
+                    ("X", "Y", "Z"),
+                    ("x", "y", "z"),
+                    ("posX", "posY", "posZ"),
+                    ("position_x", "position_y", "position_z"),
+                ]
+                for cx, cy, cz in coord_candidates:
+                    if cx in k.columns and cy in k.columns and cz in k.columns:
+                        k["x"] = pd.to_numeric(k[cx], errors="coerce")
+                        k["y"] = pd.to_numeric(k[cy], errors="coerce")
+                        k["z"] = pd.to_numeric(k[cz], errors="coerce")
+                        break
+
+            # types
+            if "headshot" in k.columns:
+                k["headshot"] = k["headshot"].astype("Int64")
+
+            # --- final selection & write ---
+            keep = [c for c in
+                    ["round", "tick", "killerSteamID", "victimSteamID", "killerSide", "weapon", "headshot", "x", "y",
+                     "z"] if c in k.columns]
             if keep:
-                write_df_sqlite(conn, add_common(kills[keep], map_name, demo_file), "kills_slim")
+                out_kills = add_common(k.loc[:, keep].copy(), map_name, demo_file)
+                write_df_sqlite(conn, out_kills, "kills_slim")
 
         # DAMAGES (slim)
         damages = to_pandas(getattr(d, "damages", None))
